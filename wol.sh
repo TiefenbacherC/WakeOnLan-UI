@@ -8,6 +8,8 @@
 #   ./wol.sh port 80  – Port dauerhaft ändern (ohne Zahl: aktuellen Port anzeigen)
 #   ./wol.sh edit     – Geräteliste bearbeiten
 #   ./wol.sh update   – neuesten Stand von GitHub holen, neu bauen und starten
+#   ./wol.sh dns      – DNS im WireGuard-VPN einrichten, damit http://wol/ funktioniert
+#                       (optional: ./wol.sh dns <name> <wireguard-interface>)
 set -euo pipefail
 
 NAME="wakeonlan-ui"
@@ -38,6 +40,34 @@ run() {
   docker run -d --name "$NAME" --restart unless-stopped --network host \
     -e PORT="$PORT" -v "$DEVICES:/config/devices.json:ro" "$IMAGE" >/dev/null
   echo "Läuft auf http://$(hostname -I 2>/dev/null | awk '{print $1}'):$PORT ($(version))"
+}
+
+# dnsmasq auf dem WireGuard-Interface: <name> zeigt auf die VPN-IP des Pi,
+# alle anderen Anfragen gehen weiter an den Router
+dns() {
+  local name="$1" iface="$2" vpn_ip router
+  vpn_ip="$(ip -4 -o addr show "$iface" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)"
+  if [ -z "$vpn_ip" ]; then
+    echo "Interface $iface hat keine IPv4-Adresse – läuft WireGuard? (Name prüfen mit: ip -br addr)" >&2
+    exit 1
+  fi
+  router="$(ip route | awk '/^default/ {print $3; exit}')"
+
+  command -v dnsmasq >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q dnsmasq; }
+  sudo tee /etc/dnsmasq.d/wakeonlan-ui.conf >/dev/null <<EOF
+# angelegt von wol.sh dns
+interface=$iface
+bind-dynamic
+no-resolv
+server=$router
+address=/$name/$vpn_ip
+EOF
+  sudo systemctl enable -q dnsmasq
+  sudo systemctl restart dnsmasq
+
+  echo "DNS läuft: $name → $vpn_ip (andere Anfragen → $router)"
+  echo "Jetzt im WireGuard-Client unter DNS eintragen: $vpn_ip"
+  [ "$PORT" = 80 ] || echo "Tipp: 'wol port 80', dann reicht http://$name/ ohne :$PORT"
 }
 
 running() {
@@ -94,8 +124,11 @@ main() {
         run
       fi
       ;;
+    dns)
+      dns "${2:-wol}" "${3:-wg0}"
+      ;;
     *)
-      echo "Verwendung: $0 {start|stop|restart|status|logs|edit|port [nummer]|update}"
+      echo "Verwendung: $0 {start|stop|restart|status|logs|edit|port [nummer]|update|dns [name] [interface]}"
       exit 1
       ;;
   esac
